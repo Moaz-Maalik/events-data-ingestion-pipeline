@@ -1,0 +1,4 @@
+user_id,event_type,timestamp,data_payload_json
+1,login,2025-11-19T10:00:00Z,{"device":"iPhone"}
+2,click,2025-11-19T10:05:00Z,{"page":"home"}
+1,logout,2025-11-19T10:10:00Z,{}
