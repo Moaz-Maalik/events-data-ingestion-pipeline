@@ -1,116 +1,195 @@
-import http from 'http';
-import { parse } from 'url';
-import { spawn } from 'child_process';
-import { postgresClient } from './connections/postgres.js';
-import { mongoClient } from './connections/mongo.js';
-import fs from 'fs';
-import path from 'path';
+// server.js
+require("dotenv").config();
+const http = require("http");
+const url = require("url");
+const fs = require("fs");
+const path = require("path");
+const csv = require("csv-parser"); // npm install csv-parser
+const pool = require("./db/pg");
+const mongoClient = require("./db/mongo");
 
-// Helper to parse JSON body
-async function getJSONBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => (body += chunk));
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(body));
-      } catch (err) {
-        reject(new Error('Invalid JSON'));
-      }
-    });
-  });
+const PORT = process.env.PORT || 3000;
+const BATCH_SIZE = 100;
+
+// Helper to send JSON
+function sendJSON(res, statusCode, data) {
+  res.writeHead(statusCode, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(data));
 }
 
-// ---- Router ----
+// POST /upload handler
+async function handleUpload(req, res) {
+  const contentType = req.headers["content-type"];
+  if (!contentType || !contentType.includes("text/csv")) {
+    sendJSON(res, 415, { message: "Unsupported Media Type" });
+    return;
+  }
+
+  let batch = [];
+  let totalEvents = 0;
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN"); // Start transaction for first batch
+
+    req
+      .pipe(csv())
+      .on("data", async (row) => {
+        // row = { user_id, event_type, timestamp, data_payload_json }
+        batch.push(row);
+
+        if (batch.length >= BATCH_SIZE) {
+          req.pause(); // pause stream to finish batch insert
+
+          try {
+            const queryText = `
+              INSERT INTO events (user_id, event_type, timestamp, data_payload_json)
+              VALUES ${batch
+                .map(
+                  (_, i) =>
+                    `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${
+                      i * 4 + 4
+                    }::jsonb)`
+                )
+                .join(", ")}
+            `;
+            const values = batch.flatMap((row) => [
+              row.user_id,
+              row.event_type,
+              row.timestamp,
+              row.data_payload_json || "{}",
+            ]);
+
+            await client.query(queryText, values);
+            totalEvents += batch.length;
+            batch = [];
+            req.resume();
+          } catch (err) {
+            await client.query("ROLLBACK");
+            console.error("Batch insert failed:", err);
+            sendJSON(res, 400, { message: "Invalid CSV data" });
+            req.destroy();
+          }
+        }
+      })
+      .on("end", async () => {
+        // Insert remaining batch
+        if (batch.length > 0) {
+          try {
+            const queryText = `
+              INSERT INTO events (user_id, event_type, timestamp, data_payload_json)
+              VALUES ${batch
+                .map(
+                  (_, i) =>
+                    `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${
+                      i * 4 + 4
+                    }::jsonb)`
+                )
+                .join(", ")}
+            `;
+            const values = batch.flatMap((row) => [
+              row.user_id,
+              row.event_type,
+              row.timestamp,
+              row.data_payload_json || "{}",
+            ]);
+            await client.query(queryText, values);
+            totalEvents += batch.length;
+          } catch (err) {
+            await client.query("ROLLBACK");
+            console.error("Final batch insert failed:", err);
+            sendJSON(res, 400, { message: "Invalid CSV data" });
+            return;
+          }
+        }
+
+        await client.query("COMMIT");
+        console.log(`Processed ${totalEvents} events`);
+
+        // TODO: calculate summary and insert into MongoDB
+        const summary = {
+          processed_at: new Date(),
+          total_events: totalEvents,
+          // You can calculate unique_users, event_counts here
+        };
+        const db = mongoClient.db(process.env.MONGO_DB);
+        await db.collection("report_summaries").insertOne(summary);
+
+        sendJSON(res, 201, {
+          message: "CSV processed successfully",
+          totalEvents,
+        });
+      })
+      .on("error", async (err) => {
+        await client.query("ROLLBACK");
+        console.error("CSV stream error:", err);
+        sendJSON(res, 400, { message: "CSV parsing error" });
+      });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Transaction error:", err);
+    sendJSON(res, 500, { message: "Server error" });
+  } finally {
+    client.release();
+  }
+}
+
+// Main server
 const server = http.createServer(async (req, res) => {
-  const { pathname } = parse(req.url, true);
+  const parsedUrl = url.parse(req.url, true);
+  const method = req.method;
+  const pathname = parsedUrl.pathname;
 
-  // ------------------------------
-  // 📌 1. POST /upload
-  // ------------------------------
-  if (req.method === 'POST' && pathname === '/upload') {
-    try {
-      const data = await getJSONBody(req);
+  if (method === "POST" && pathname === "/upload") {
+    await handleUpload(req, res);
+    return;
+  }
 
-      const events = data.events;
-      if (!Array.isArray(events)) {
-        res.writeHead(400);
-        return res.end(JSON.stringify({ error: 'events must be an array' }));
-      }
+  // ----------------------
+  // GET /reports/:id
+  // ----------------------
+  if (req.method === "GET" && req.url.startsWith("/reports/")) {
+    const reportId = req.url.split("/")[2];
 
-      // Insert events into PostgreSQL
-      const pg = postgresClient;
-
-      for (const evt of events) {
-        await pg.query(
-          'INSERT INTO events (user_id, action, metadata) VALUES ($1, $2, $3)',
-          [evt.user_id, evt.action, evt.metadata || {}]
-        );
-      }
-
-      // Create summary
-      const summary = {
-        created_at: new Date(),
-        total_events: events.length
-      };
-
-      // Save summary in MongoDB
-      const db = mongoClient.db(process.env.MONGO_DB);
-      const result = await db.collection('report_summaries').insertOne(summary);
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ report_id: result.insertedId }));
-
-    } catch (err) {
-      console.error(err);
-      res.writeHead(500);
-      res.end(JSON.stringify({ error: 'upload failed' }));
+    // Validate ID format
+    if (!reportId || reportId.length !== 24) {
+      sendJSON(res, 400, { message: "Invalid report ID" });
+      return;
     }
-    return;
-  }
 
-  // ------------------------------
-  // 📌 2. GET /reports/:id
-  // ------------------------------
-  if (req.method === 'GET' && pathname.startsWith('/reports/')) {
-    const id = pathname.split('/')[2];
-
-    // Spawn the generator
-    const subprocess = spawn('node', ['report-generator.js', id], {
-      stdio: ['ignore', 'pipe', 'pipe']
+    // Spawn child process
+    const child = spawn("node", ["report-generator.js", reportId], {
+      stdio: "inherit", // show logs in console
     });
 
-    let output = '';
-    subprocess.stdout.on('data', chunk => (output += chunk));
-    subprocess.stderr.on('data', chunk => console.error('GEN ERROR:', chunk.toString()));
-
-    subprocess.on('close', code => {
+    child.on("exit", (code) => {
       if (code !== 0) {
-        res.writeHead(500);
-        return res.end(JSON.stringify({ error: 'Report generation failed' }));
+        sendJSON(res, 500, { message: "Failed to generate report" });
+        return;
       }
 
-      const filePath = `/tmp/report-${id}.json`;
+      // Success → read file from /tmp
+      const filePath = path.join("/tmp", `report-${reportId}.json`);
+
       if (!fs.existsSync(filePath)) {
-        res.writeHead(404);
-        return res.end(JSON.stringify({ error: 'Report not found' }));
+        sendJSON(res, 500, { message: "Report file missing" });
+        return;
       }
 
-      const fileStream = fs.createReadStream(filePath);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      fileStream.pipe(res);
+      const data = fs.readFileSync(filePath, "utf8");
+
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+      });
+      res.end(data);
     });
 
     return;
   }
 
-  // Default
-  res.writeHead(404);
-  res.end('Not found');
+  sendJSON(res, 404, { message: "Route not found" });
 });
 
-// Start server
-server.listen(3000, () => {
-  console.log('Server running on http://localhost:3000');
+server.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
 });
-
